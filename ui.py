@@ -1,11 +1,16 @@
 import streamlit as st
 from neo4j import GraphDatabase, basic_auth
 from neo4j.exceptions import ServiceUnavailable, AuthError
-from neo4j_processes import add_movie_person, add_user, add_movie_with_genres, delete_person, delete_all, link_movieperson_to_movie, rate_movie, delete_person_relationship, delete_user_relationship, delete_movie, delete_user
+from neo4j_processes import *
 import pandas as pd
 from streamlit_option_menu import option_menu
 from pyvis.network import Network
 import streamlit.components.v1 as components
+import matplotlib.pyplot as plt
+import networkx as nx
+import plotly.express as px
+import joblib, os
+import networkx as nx
 
 # Bağlantı bilgileri
 NEO4J_URI = "bolt://localhost:7687"
@@ -24,6 +29,29 @@ def get_driver():
     return GraphDatabase.driver(NEO4J_URI, auth=basic_auth(NEO4J_USER, NEO4J_PASS))
 
 
+MODEL_FILES  = {
+    "RandomForest": "RandomForest.pkl",
+    "Ridge":        "Ridge.pkl",
+    "KNN":          "KNN.pkl",
+}
+USER_ENC_FILE  = "user_encoder.pkl"
+MOVIE_ENC_FILE = "movie_encoder.pkl"
+
+def load_model():
+    # 1) Modeller ve encoder dosyaları var mı?
+    files_ok = all(os.path.exists(p) for p in MODEL_FILES.values()) \
+               and os.path.exists(USER_ENC_FILE) \
+               and os.path.exists(MOVIE_ENC_FILE)
+    if files_ok:
+        models = {n: joblib.load(p) for n, p in MODEL_FILES.items()}
+        user_enc  = joblib.load(USER_ENC_FILE)
+        movie_enc = joblib.load(MOVIE_ENC_FILE)
+        return models, user_enc, movie_enc
+
+    # 2) Eksikse yeniden eğit
+    df = getAllData()
+    return encodeTrainTest(df)
+    
 def check_neo4j_connection():
     try:
         driver = get_driver()
@@ -32,7 +60,6 @@ def check_neo4j_connection():
         return True
     except (ServiceUnavailable, AuthError, Exception):
         return False
-
 
 def get_graph_data(selected_types):
     driver = get_driver()
@@ -69,6 +96,10 @@ def get_graph_data(selected_types):
 
 
 def draw_network(graph_data, selected_types):
+    rel_counter = 0
+    node_counter = 0
+    from pyvis.network import Network
+
     rel_records = graph_data["rel_records"]
     solo_nodes = graph_data["solo_nodes"]
 
@@ -88,38 +119,36 @@ def draw_network(graph_data, selected_types):
         else:
             return "#D3D3D3"
 
-    # İlişkili düğümler ve kenarlar
+    def should_add(labels):
+        return not selected_types or any(lbl in selected_types for lbl in labels)
+
+    def add_node_if_needed(node):
+        node_id = node.element_id
+        if node_id not in added_nodes:
+            labels = list(node.labels)
+            if should_add(labels):
+                label = node.get("name") or node.get("title") or node.get("username")
+                tooltip = "\n".join([f"{k}: {v}" for k, v in node.items()])
+                net.add_node(node_id, label=label, title=tooltip, color=get_color(labels))
+                added_nodes.add(node_id)
+
+    # Önce tüm geçerli düğümleri ekle (ilişkili ve ilişkisiz)
+    all_nodes = [rec["n"] for rec in rel_records] + [rec["m"] for rec in rel_records] + [rec["n"] for rec in solo_nodes]
+    for node in all_nodes:
+        node_counter += 1
+        add_node_if_needed(node)
+        if node_counter >= 100:
+            break
+
+    # Şimdi sadece ilişkili düğümler arasında kenar ekle
     for record in rel_records:
-        n = record["n"]
-        m = record["m"]
-        r = record["rel_type"]
-
-        for node in [n, m]:
-            node_id = node.element_id
-            if node_id not in added_nodes:
-                labels = list(node.labels)
-                if not selected_types or any(lbl in selected_types for lbl in labels):
-                    color = get_color(labels)
-                    label = node.get("name") or node.get("title") or n.get("username")
-                    tooltip = "\n".join([f"{k}: {v}" for k, v in node.items()])
-                    net.add_node(node_id, label=label, title=tooltip, color=color)
-                    added_nodes.add(node_id)
-
-        if n.element_id in added_nodes and m.element_id in added_nodes:
-            net.add_edge(n.element_id, m.element_id, label=r)
-
-    # İlişkisiz düğümler
-    for record in solo_nodes:
-        n = record["n"]
-        n_id = n.element_id
-        if n_id not in added_nodes:
-            labels = list(n.labels)
-            if not selected_types or any(lbl in selected_types for lbl in labels):
-                color = get_color(labels)
-                label = n.get("name") or n.get("title") or n.get("username")
-                tooltip = "\n".join([f"{k}: {v}" for k, v in n.items()])
-                net.add_node(n_id, label=label, title=tooltip, color=color)
-                added_nodes.add(n_id)
+        rel_counter += 1
+        n_id = record["n"].element_id
+        m_id = record["m"].element_id
+        if n_id in added_nodes and m_id in added_nodes:
+            net.add_edge(n_id, m_id, label=record["rel_type"])
+        if rel_counter >= 500:
+            break
 
     return net
 
@@ -202,7 +231,7 @@ if check_neo4j_connection() == True:
             width: 100%;
             background-color: transparent; /* Green */
             border: 2px solid transparent; /* Green */
-            color: black; 
+            color: black;
             padding: 10px 20px;
             text-align: center;
             border-radius: 10px;
@@ -242,7 +271,7 @@ if check_neo4j_connection() == True:
 
         selected = option_menu(
             menu_title=None,
-            options=["Home", "Add Data", "Delete Data", "Explore / Visualize", "ML Analysis", "About & Settings"],
+            options=["Home", "Add Data", "Delete Data", "Explore / Visualize", "ML & Analysis", "About & Settings"],
             icons=["house", "plus-circle", "trash", "search", "graph-up-arrow", "gear"],
             menu_icon=None,
             default_index=0,
@@ -254,7 +283,7 @@ if check_neo4j_connection() == True:
                 "nav-link": {"font-size": "18px", "--hover-color": "#f78b83"},
                 "nav-link-selected": {"background-color": "#f78b83", "color": "#000000", "font-weight": "normal"},
             },
-        ) 
+        )
 
 
 
@@ -270,7 +299,7 @@ if check_neo4j_connection() == True:
         st.markdown("<p style='text-align: left; font-size: 18px;'>Use the form below to add data to your Neo4j database.</p>", unsafe_allow_html=True)
 
         tab1, tab2 = st.tabs(["Add by Selection", "Add by Query"])
-        
+
         with tab1:
 
             # Add your form for adding data here
@@ -287,7 +316,7 @@ if check_neo4j_connection() == True:
             if option == "Add Person":
 
                 st.markdown("<h3 style='text-align: left; font-size: 20px;'>Add Person</h3>", unsafe_allow_html=True)
-                
+
                 user_type = st.selectbox("Select Category", ["User", "Movie Person"])
                 st.markdown("<p style='text-align: left; font-size: 17px;'>Select a person category.</p>", unsafe_allow_html=True)
 
@@ -313,11 +342,11 @@ if check_neo4j_connection() == True:
                     with col1:
                         name = st.text_input("Enter the person's name")
                         age = st.number_input("Enter the person's age", min_value=0, max_value=120, value=25, step=1)
-                    
+
                     with col2:
                         roles = st.multiselect("Select one or more roles", ["Actor", "Director", "Producer"])
                         gender = st.selectbox("Select the gender", ["Male", "Female"])
-                    
+
                     ###### GUNCELLENECEK ######
                     if st.button("Add Person"):
                         if not name or not roles:
@@ -337,10 +366,10 @@ if check_neo4j_connection() == True:
 
                 with col1:
                     title = st.text_input("Enter the movie name")
-                
+
                 with col2:
                     year = st.number_input("Enter the release year", min_value=1900, max_value=2100, value=2025, step=1)
-                
+
                 with col3:
                     genres = st.multiselect("Select one or more genres", ["Action", "Comedy", "Drama", "Horror", "Sci-Fi", "Crime", "Romance", "Thriller", "Fantasy", "Adventure", "Documentary", "Animation", "Biography", "Family", "History", "War", "Western"])
 
@@ -363,15 +392,15 @@ if check_neo4j_connection() == True:
                 if selected == "User":
                     st.markdown("<p style='text-align: left; font-size: 17px;'>Select a movie and a user.</p>", unsafe_allow_html=True)
                     st.markdown("<p style='text-align: left; font-size: 17px;'>The 'RATED' relation will be created between User and Movie.</p>", unsafe_allow_html=True)
-                
+
                     col1, col2, col3 = st.columns(3)
 
                     with col1:
                         user_name = st.text_input("Enter the user's name for relationship")
-                    
+
                     with col2:
                         movie_title = st.text_input("Enter the movie title for relationship")
-                    
+
                     with col3:
                         score = st.number_input("Enter the score", min_value=0.0, max_value=10.0, value=5.0, step=0.1)
 
@@ -394,10 +423,10 @@ if check_neo4j_connection() == True:
 
                     with col1:
                         person_name = st.text_input("Enter the person's name for relationship")
-                    
+
                     with col2:
                         movie_title = st.text_input("Enter the movie title for relationship")
-                    
+
                     with col3:
                         selected_roles = st.multiselect("Select one or more roles", ["ACTED_IN", "DIRECTED", "PRODUCED"])
 
@@ -452,7 +481,7 @@ if check_neo4j_connection() == True:
 
         tab1, tab2 = st.tabs(["Delete by Selection", "Delete by Query"])
 
-        with tab1:  
+        with tab1:
             st.markdown("<p style='text-align: left; font-size: 17px;'>Select a option for deleting data to database.</p>", unsafe_allow_html=True)
 
             option = st.selectbox(
@@ -508,15 +537,15 @@ if check_neo4j_connection() == True:
                             with driver.session() as session:
                                 session.execute_write(delete_movie, title=title.strip())
                         st.success(f"Movie '{title}' deleted successfully!")
-            
+
 
             elif option == "Delete Relationship":
                 st.markdown("<h3 style='text-align: left; font-size: 20px;'>Delete Relationship</h3>", unsafe_allow_html=True)
                 st.markdown("<p style='text-align: left; font-size: 17px;'>Select a relationship type to delete.</p>", unsafe_allow_html=True)
                 source_label = st.selectbox("Source Type", ["Person", "User"])
-                
+
                 if source_label == "Person":
-                    
+
                     col1, col2, col3 = st.columns(3)
                     with col1:
                         source_name = st.text_input("Source Name")
@@ -526,7 +555,7 @@ if check_neo4j_connection() == True:
                         rel_type = st.selectbox("Relationship Type", ["ACTED_IN", "DIRECTED", "PRODUCED"])
 
                     submitted = st.button("Delete Relationship")
-                
+
                     if submitted:
                         driver = get_driver()
 
@@ -551,7 +580,7 @@ if check_neo4j_connection() == True:
 
 
                     submitted = st.button("Delete Relationship")
-                    
+
                     if submitted:
                         driver = get_driver()
 
@@ -653,16 +682,262 @@ if check_neo4j_connection() == True:
 
             st.download_button("Export Full Graph CSV", data=full_df.to_csv(index=False).encode("utf-8"), file_name="full_graph_data.csv")
 
-    if st.session_state.page == "ML Analysis":
-        st.markdown("<h1 style='text-align: left; font-size: 30px;'>Machine Learning Analysis</h1>", unsafe_allow_html=True)
+
+    if st.session_state.page == "ML & Analysis":
+        st.markdown("<h1 style='text-align: left; font-size: 30px;'>Machine Learning & Analysis</h1>", unsafe_allow_html=True)
         st.markdown("<p style='text-align: left; font-size: 18px;'>Use the options below to perform machine learning analysis on your Neo4j database.</p>", unsafe_allow_html=True)
 
         # Add your options for machine learning analysis here
         # For example, you can use st.selectbox() to let users choose what kind of analysis to perform
 
+        tabs = st.tabs(["🎯 Degree Distribution", "🧩 Community Detection", "⭐ Centralities", "📊 Knowledge Graph Completion", "📈 Link Prediction", "Similarity Graph"])
+
+
+        with tabs[0]:
+            st.markdown("<h3 style='text-align: left; font-size: 20px;'>Degree Distribution</h3>", unsafe_allow_html=True)
+            st.markdown("<p style='text-align: left; font-size: 18px;'>This graph shows the degree distribution of the nodes in the database.</p>", unsafe_allow_html=True)
+
+            degrees = get_degree_distribution()
+
+            if degrees:
+                fig = px.histogram(
+                    x=degrees,
+                    nbins=30,
+                    labels={'x': 'Degree', 'y': 'Node Count'},
+                    title="Node Degree Distribution",
+                )
+                fig.update_traces(marker_color='indianred')
+                fig.update_layout(
+                    xaxis_title="Degree",
+                    yaxis_title="Number of Nodes",
+                    bargap=0.1
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("Veri bulunamadı. Lütfen Neo4j veritabanını kontrol edin.")
+
+            st.markdown("""
+                **📘 Note:** This graph shows how many connections each node has. A higher degree indicates that the node is highly connected and may be more centrally located in the network.
+                """)
+
+
+        with tabs[1]:
+            st.markdown("<h3 style='text-align: left; font-size: 20px;'>Community Detection with Louvain Algorithm</h3>", unsafe_allow_html=True)
+            st.markdown("<p style='text-align: left; font-size: 18px;'>This section allows you to detect communities in the graph using the Louvain algorithm.</p>", unsafe_allow_html=True)
+
+            if st.button("Run Louvain Algorithm"):
+
+                with st.spinner("Algorithm is running..."):
+                    result = run_louvain_community_detection(driver, graph_name='full-movie-graph')
+
+                    if result:
+                        st.success("Louvain algorithm ran successfully!")
+
+                        st.write(f"🔹 Total number of communities: {result.get('communityCount', 'N/A')}")
+                        st.write(f"🔹 Modularity score: {result.get('modularity', 'N/A')}")
+
+                        # Topluluk bazında detaylı veri çekiliyor
+                        with driver.session() as session:
+                            community_data = session.execute_read(get_community_data)
+
+                        if community_data:
+                            st.write("Number of nodes per community:")
+
+                            # Burada örnek olarak Streamlit'in bar_chart fonksiyonunu kullanabiliriz:
+                            import pandas as pd
+
+                            df = pd.DataFrame(community_data)
+                            community_counts = df['community'].value_counts().sort_index()
+                            st.bar_chart(community_counts)
+
+                            st.write("Detailed community assignment data")
+                            st.dataframe(df)
+
+                        else:
+                            st.warning("No detailed community data available. Only summary results are shown.")
+                    else:
+                        st.warning("Algorithm failed to run or returned no results.")
+            else:
+                st.info("Click the button to run the Louvain algorithm.")
+
+
+
+        with tabs[2]:
+            st.markdown("<h3 style='text-align: left; font-size: 20px;'>Centralities</h3>", unsafe_allow_html=True)
+            st.markdown("<p style='text-align: left; font-size: 18px;'>This section allows you to analyze the centrality of nodes in the graph.</p>", unsafe_allow_html=True)
+            clearGDS()  
+            create_gds_projection()
+
+
+            centrality_options = [
+            "Degree Centrality",
+            "Betweenness Centrality",
+            "PageRank"
+            ]
+
+            selected_centrality = st.selectbox("Select Centrality Measure", centrality_options)
+
+            if st.button("Run Centrality"):
+
+                with st.spinner("Clearing previous GDS data..."):
+                    clearGDS()
+
+                with st.spinner("Creating GDS projection..."):
+                    create_gds_projection()
+
+                with st.spinner("Running centrality algorithm..."):
+                    if selected_centrality == "Degree Centrality":
+                        centralities = degreeCentralityGDS()
+                        label_y = "Degree Centrality"
+
+                    elif selected_centrality == "Betweenness Centrality":
+                        centralities = betweennessGDS()
+                        label_y = "Betweenness Centrality"
+
+                    elif selected_centrality == "PageRank":
+                        centralities = pageRankGDS()
+                        label_y = "PageRank Centrality"
+
+                    if centralities:
+                        with st.spinner("Fetching centrality results..."):
+                            st.subheader(f"Top 10 Centrality Nodes - {selected_centrality}")
+                            st.table(centralities)
+
+                            names = [row['name'] for row in centralities]
+                            scores = [row['score'] for row in centralities]
+
+                            fig = px.bar(x=names, y=scores, labels={'x': 'Node', 'y': label_y})
+                            st.plotly_chart(fig)
+                    else:
+                        st.warning("Centrality result not found.")
+
+
+
+        with tabs[3]:
+            st.markdown("<h3 style='text-align: left; font-size: 20px;'>Knowledge Graph Completion</h3>", unsafe_allow_html=True)
+            st.markdown("<p style='text-align: left; font-size: 18px;'>This section allows you to analyze the distribution of nodes and relationships in the knowledge graph.</p>", unsafe_allow_html=True)
+            
+            options = ["Node Distribution by Label", "Relationship Distribution"]
+            selected_option = st.selectbox("Select an option", options)
+
+            if st.button("Show Knowledge Graph Distribution"):
+                
+                if selected_option == "Node Distribution by Label":
+                    with st.spinner("Fetching node distribution..."):
+                        node_dist = get_node_label_distribution()
+                    
+                        st.subheader("Node Label Distribution")
+                        st.table(node_dist)
+
+                        labels = [row['label'] for row in node_dist]
+                        counts = [row['count'] for row in node_dist]
+
+                        fig = px.pie(names=labels, values=counts, title="Node Types Distribution")
+                        st.plotly_chart(fig)
+
+                elif selected_option == "Relationship Distribution":
+                    with st.spinner("Fetching relationship distribution..."):
+                        rel_dist = get_relationship_distribution()
+
+                        st.subheader("Relationship Type Distribution")
+                        st.table(rel_dist)
+
+                        rel_labels = [row['relationship_type'] for row in rel_dist]
+                        rel_counts = [row['count'] for row in rel_dist]
+
+                        fig2 = px.bar(x=rel_labels, y=rel_counts, labels={'x': 'Relationship Type', 'y': 'Count'}, title="Relationship Types Frequency")
+                        st.plotly_chart(fig2)
+
+
+        with tabs[4]:
+            st.markdown("<h3 style='text-align: left; font-size: 20px;'>Link Prediction</h3>", unsafe_allow_html=True)
+
+            # Modelleri ve encoder’ları yükle / eğit
+            models, user_enc, movie_enc = load_model()
+            df = getAllData()
+
+            # Kullanıcı seçimi
+            selected_user = st.selectbox("Select a user for prediction:", user_enc.classes_)
+
+            if st.button("Create Prediction") and selected_user:
+                with st.spinner("Creating predictions…"):
+                    # Her model için öneri tablosu
+                    for name, mdl in models.items():
+                        recs = recommend_movies(selected_user, mdl, df, user_enc, movie_enc)
+                        st.subheader(f"Top Recommendations by {name}")
+                        st.table(recs)
+
+                    # Metriğe Göre Karşılaştırma Tablosu
+                    st.markdown("### Models Comparison by Metrics")
+                    results_df = pd.read_json("results_df.json", orient="records", lines=True)
+                    st.dataframe(results_df)
+
+                    # Metriğe Göre Karşılaştırma Grafikleri
+                    # —————————————————————————————
+                    # Model’i index’e alıp sadece metrik sütunlarına odaklanıyoruz
+                    metrics_df = (
+                        results_df
+                        .set_index('Model')[['MSE','MAE','R2']]
+                        .rename_axis(index='Model')
+                    )
+
+                    st.markdown("### Metrics Bar Chart")
+                    # Streamlit’in hızlı çubuk grafik fonksiyonu
+                    st.bar_chart(metrics_df)
+
+                    # Eğer ayrı ayrı grafikleri tercih ederseniz:
+                    cols = st.columns(3)
+                    with cols[0]:
+                        st.markdown("**MSE by Model**")
+                        st.bar_chart(metrics_df[['MSE']])
+                    with cols[1]:
+                        st.markdown("**MAE by Model**")
+                        st.bar_chart(metrics_df[['MAE']])
+                    with cols[2]:
+                        st.markdown("**R2 by Model**")
+                        st.bar_chart(metrics_df[['R2']])
+            else:
+                st.warning("Lütfen önce bir kullanıcı seçip ‘Create Prediction’ butonuna tıklayın.")
+
+        with tabs[5]:
+            st.markdown("<h3 style='text-align: left; font-size: 20px;'>Similarity Graph</h3>", unsafe_allow_html=True)
+            st.markdown("<p style='text-align: left; font-size: 18px;'>This section allows you to visualize the similarity graph of movies.</p>", unsafe_allow_html=True)
+
+            if st.button("Find Similar Movies"):
+                df= get_similarity_graph()
+
+                st.write("Top 20 Similar Movies:")
+                st.table(df)
+                
+                # Create a network graph
+                net = Network(
+                    height="600px", width="100%", 
+                    bgcolor="#ffffff", font_color="black", directed=True
+                )
+
+                # 3) Düğümleri ekle
+                for node in pd.concat([df['movie1'], df['movie2']]).unique():
+                    net.add_node(node, label=node, title=node)
+
+                # 4) Kenarları ekle (kalınlık similarity’ye orantılı)
+                for _, row in df.iterrows():
+                    net.add_edge(
+                        row['movie1'], row['movie2'], 
+                        value=row['sim'], 
+                        title=f"sim: {row['sim']}"
+                    )
+
+                # 5) Fiziksel simülasyon ve ayarlar
+                net.toggle_physics(True)
+                net.repulsion(node_distance=150, central_gravity=0.2)
+
+                # 6) HTML olarak render et ve Streamlit’e göm
+                html = net.generate_html()
+                components.html(html, height=650, scrolling=True)
+
     if st.session_state.page == "About & Settings":
         st.markdown("<h1 style='text-align: left; font-size: 30px;'>About & Settings</h1>", unsafe_allow_html=True)
-        
+
 
         st.markdown("<h3 style='text-align: left; font-size: 20px;'>About</h3>", unsafe_allow_html=True)
         st.markdown("<p style='text-align: left; font-size: 16px;'>This app is built using Streamlit and Neo4j.</p>", unsafe_allow_html=True)

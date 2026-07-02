@@ -41,30 +41,34 @@ async def enterprise_agent_engine(user_prompt: str):
             await asyncio.sleep(0.1)
             
             # ==============================================================================
-            # 🚨 AMİRAL BURASI KRİTİK: FastMCP Çöplerini Ayıklayıp Saf OpenAI Şeması Kuruyoruz
+            # 🛡️ KURŞUN GEÇİRMEZ ŞEMA DÖNÜŞTÜRÜCÜ (DIREKT TIP KONTROLÜ)
             # ==============================================================================
             llm_formatted_tools = []
             if available_tools_rpc and hasattr(available_tools_rpc, "tools"):
                 for t in available_tools_rpc.tools:
-                    # Nesne özelliklerini güvenle söküyoruz
                     t_name = getattr(t, "name", "unknown")
                     t_desc = getattr(t, "description", "F5 BIG-IP Tool")
                     t_schema = getattr(t, "input_schema", getattr(t, "inputSchema", {}))
                     
-                    # Eğer şema bir Pydantic modeli olarak gelirse dict'e çeviriyoruz
-                    if hasattr(t_schema, "model_dump"):
-                        t_schema = t_schema.model_dump()
-                    elif not isinstance(t_schema, dict):
-                        t_schema = {}
+                    # 🎯 Line 56 Hatasını Kökten Çözen Güvenli Sözlük Dönüşümü:
+                    schema_dict = {}
+                    if isinstance(t_schema, dict):
+                        schema_dict = t_schema
+                    elif hasattr(t_schema, "model_dump") and callable(getattr(t_schema, "model_dump", None)):
+                        schema_dict = t_schema.model_dump()
+                    elif hasattr(t_schema, "dict") and callable(getattr(t_schema, "dict", None)):
+                        schema_dict = t_schema.dict()
                     
-                    # 🎯 vLLM asla 'inputSchema/outputSchema' kabul etmez. 'parameters' ister!
+                    # Saf OpenAI parametre yapısını izole ediyoruz
+                    properties_block = schema_dict.get("properties", {}) if isinstance(schema_dict, dict) else {}
+                    required_block = schema_dict.get("required", []) if isinstance(schema_dict, dict) else []
+                    
                     clean_parameters = {
                         "type": "object",
-                        "properties": t_schema.get("properties", {}),
-                        "required": t_schema.get("required", [])
+                        "properties": properties_block,
+                        "required": required_block
                     }
                     
-                    # 🛡️ FastMCP'nin 'outputSchema', '_meta' ve 'tags' gibi vLLM'i çıldırtan tüm alanlarını kazıdık!
                     llm_formatted_tools.append({
                         "type": "function",
                         "function": {
@@ -95,14 +99,14 @@ async def enterprise_agent_engine(user_prompt: str):
                 tool_calls = getattr(response_message, "tool_calls", None)
                 
             except Exception:
-                # Altyapı ne arıza çıkartırsa çıkarsın mutlak koruma barikatı:
+                # Altyapı şema uyuşmazlığından hata verirse burası otonom koruma sağlar
                 native_tools_failed = True
 
             # ==============================================================================
-            # 🚀 SENARYO A: HER ŞEYE RAĞMEN HATA OLURSA DEVREYE GİREN AKILLI METİN PROTOKOLÜ
+            # 🚀 FALLBACK MODE: METİN PROTOKOLÜ TAVSİYESİ
             # ==============================================================================
             if native_tools_failed or tool_calls is None:
-                yield f"data: {json.dumps({'token': '⚠️ [Altyapı Sınırı] Metin Protokolü (Text-Protocol Mode) otonom olarak devreye alınıyor...\n\n'})}\n\n"
+                yield f"data: {json.dumps({'token': '⚠️ [vLLM Koruması] Şema bypass edildi. Metin Protokolü (Text-Protocol) üzerinden otonom akış başlatılıyor...\n\n'})}\n\n"
                 await asyncio.sleep(0.2)
                 
                 tools_text_desc = ""
